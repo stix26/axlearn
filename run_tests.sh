@@ -2,9 +2,13 @@
 
 set -e -x
 
-# Install the package (necessary for CLI tests).
-# Requirements should already be cached in the docker image.
-pip install -e .
+# Install axlearn along with development dependencies. This pulls in
+# JAX, seqio, timm and other packages required by the tests.
+pip install -e '.[dev]'
+
+# Some environments may not correctly install optional extras, so we
+# explicitly ensure a few core packages are available.
+pip install --no-deps jax==0.5.3 jaxlib==0.5.3 seqio==0.0.18 toml pika pre-commit pytest pytest-xdist
 
 # Log installed versions
 echo "PIP FREEZE:"
