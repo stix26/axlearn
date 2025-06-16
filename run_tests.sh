@@ -6,6 +6,10 @@ set -e -x
 # Requirements should already be cached in the docker image.
 pip install -e .
 
+# Ensure core test dependencies are available. Some environments may
+# not install optional extras correctly, so we install them explicitly.
+pip install jax==0.5.3 jaxlib==0.5.3 seqio==0.0.18 toml pika pre-commit pytest pytest-xdist
+
 # Log installed versions
 echo "PIP FREEZE:"
 pip freeze
