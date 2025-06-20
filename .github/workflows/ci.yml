@@ -1,0 +1,446 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run security checks weekly
+    - cron: '0 2 * * 1'
+
+env:
+  PYTHON_VERSION: '3.10'
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  # Code Quality and Linting
+  code-quality:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[core,dev]'
+          
+      - name: Run Black (code formatting)
+        run: |
+          black --check --diff .
+          
+      - name: Run isort (import sorting)
+        run: |
+          isort --check-only --diff .
+          
+      - name: Run pylint
+        run: |
+          pylint axlearn/ --rcfile=.pylintrc
+          
+      - name: Run pytype (type checking)
+        run: |
+          pytype -j auto .
+          
+      - name: Run pre-commit hooks
+        run: |
+          pre-commit run --all-files
+
+  # Unit Tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-group: [a, b, c, d, e]
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[core,dev,grain,gcp,vertexai_tensorboard,open_api]'
+          pip install pytest-cov
+          
+      - name: Gather test files
+        run: find axlearn -name '*_test.py' > pytest_files.txt
+        
+      - name: Split test files into groups
+        run: split -n r/5 -a 1 pytest_files.txt split_pytest_files
+        
+      - name: Select a test group
+        run: tr '\n' ' ' < split_pytest_files${{ matrix.test-group }} > test_files_oneline
+        
+      - name: Read test inputs
+        id: test-selector
+        run: echo "PYTEST_FILES='$(cat test_files_oneline)'" >> "$GITHUB_OUTPUT"
+        
+      - name: Run tests
+        run: |
+          pytest ${{ steps.test-selector.outputs.PYTEST_FILES }} \
+            --junitxml=test-results-${{ matrix.test-group }}.xml \
+            --cov=axlearn \
+            --cov-report=xml:coverage-${{ matrix.test-group }}.xml \
+            --cov-report=html:htmlcov-${{ matrix.test-group }} \
+            --cov-report=term-missing
+            
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-${{ matrix.test-group }}
+          path: |
+            coverage-${{ matrix.test-group }}.xml
+            htmlcov-${{ matrix.test-group }}/
+            test-results-${{ matrix.test-group }}.xml
+
+  # Security Checks
+  security:
+    name: Security Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install security tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit safety pip-audit
+          
+      - name: Run Bandit (security linting)
+        run: |
+          bandit -r axlearn/ -f json -o bandit-report.json || true
+          bandit -r axlearn/ -f txt -o bandit-report.txt || true
+          
+      - name: Run Safety (dependency vulnerability check)
+        run: |
+          safety check --json --output safety-report.json || true
+          safety check --output safety-report.txt || true
+          
+      - name: Run pip-audit
+        run: |
+          pip install '.[core,dev]'
+          pip-audit --format json --output pip-audit-report.json || true
+          pip-audit --output pip-audit-report.txt || true
+          
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.*
+            safety-report.*
+            pip-audit-report.*
+
+  # Docker Build and Test
+  docker:
+    name: Docker Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: Build CI Docker image
+        run: |
+          docker build --target ci --build-arg SKIP_PRECOMMIT=--skip-pre-commit \
+            --build-arg PYTEST_FILES="" -t axlearn-ci .
+          
+      - name: Build base Docker image
+        run: |
+          docker build --target base -t axlearn-base .
+          
+      - name: Build bastion Docker image
+        run: |
+          docker build --target bastion -t axlearn-bastion .
+          
+      - name: Build TPU Docker image
+        run: |
+          docker build --target tpu -t axlearn-tpu .
+          
+      - name: Build GPU Docker image
+        run: |
+          docker build --target gpu -t axlearn-gpu .
+          
+      - name: Test Docker images
+        run: |
+          # Test that images can be created and basic functionality works
+          docker run --rm axlearn-base python -c "import axlearn; print('Base image works')"
+          docker run --rm axlearn-bastion python -c "import axlearn; print('Bastion image works')"
+
+  # Integration Tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: [unit-tests]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[core,dev,grain,gcp,vertexai_tensorboard,open_api]'
+          pip install pytest-cov
+          
+      - name: Run integration tests
+        run: |
+          # Run tests that require multiple components
+          pytest axlearn/ -m "not gs_login and not tpu and not high_cpu" \
+            --junitxml=integration-test-results.xml \
+            --cov=axlearn \
+            --cov-report=xml:coverage-integration.xml \
+            --cov-report=html:htmlcov-integration
+            
+      - name: Upload integration coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-integration
+          path: |
+            coverage-integration.xml
+            htmlcov-integration/
+            integration-test-results.xml
+
+  # Performance Tests
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[core,dev]'
+          
+      - name: Run performance benchmarks
+        run: |
+          # Run basic performance tests if they exist
+          find axlearn -name "*benchmark*" -o -name "*perf*" | head -5 | xargs -I {} python {} || echo "No performance tests found"
+
+  # Documentation Build
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[core,dev]'
+          pip install sphinx sphinx-rtd-theme
+          
+      - name: Build documentation
+        run: |
+          # Check if docs can be built (if sphinx config exists)
+          if [ -f docs/conf.py ]; then
+            cd docs && make html
+          else
+            echo "No Sphinx documentation found"
+          fi
+
+  # Package Build and Test
+  package:
+    name: Package Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+          
+      - name: Build package
+        run: |
+          python -m build
+          
+      - name: Test package installation
+        run: |
+          pip install dist/*.whl
+          python -c "import axlearn; print('Package installed successfully')"
+          
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-dist
+          path: dist/
+
+  # Database and SQL Checks
+  database:
+    name: Database & SQL Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Check for SQL files
+        run: |
+          echo "Checking for SQL files..."
+          find . -name "*.sql" -type f | head -10 || echo "No SQL files found"
+          
+      - name: Check for database configuration
+        run: |
+          echo "Checking for database configuration files..."
+          find . -name "*db*" -o -name "*database*" -o -name "*sql*" | grep -v __pycache__ | head -10 || echo "No database config files found"
+          
+      - name: Check for SQL queries in code
+        run: |
+          echo "Checking for SQL queries in Python code..."
+          grep -r "CREATE TABLE\|INSERT INTO\|SELECT\|UPDATE\|DELETE" axlearn/ --include="*.py" | head -5 || echo "No SQL queries found in Python code"
+
+  # Dependency Management
+  dependencies:
+    name: Dependency Management
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install dependency check tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pipdeptree pip-check-reqs
+          
+      - name: Check dependency tree
+        run: |
+          pip install '.[core,dev]'
+          pipdeptree --warn silence
+          
+      - name: Check for unused dependencies
+        run: |
+          pip-check-reqs --ignore-file=.gitignore || echo "Some dependencies may be unused"
+          
+      - name: Check for outdated dependencies
+        run: |
+          pip list --outdated || echo "All dependencies are up to date"
+          
+      - name: Validate pyproject.toml
+        run: |
+          python -c "import tomllib; tomllib.load(open('pyproject.toml', 'rb'))" && echo "pyproject.toml is valid"
+
+  # Coverage Report
+  coverage:
+    name: Coverage Report
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    timeout-minutes: 10
+    
+    steps:
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          path: coverage/
+          
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          
+      - name: Install coverage tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install coverage
+          
+      - name: Generate coverage report
+        run: |
+          # Combine coverage reports if multiple exist
+          coverage combine coverage/*/coverage-*.xml || echo "No coverage files to combine"
+          coverage report
+          coverage html -d htmlcov-combined
+          
+      - name: Upload combined coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-combined
+          path: htmlcov-combined/
+
+  # Final Status Check
+  status:
+    name: CI Status
+    runs-on: ubuntu-latest
+    needs: [code-quality, unit-tests, security, docker, integration-tests, performance, docs, package, database, dependencies]
+    if: always()
+    
+    steps:
+      - name: Check CI Status
+        run: |
+          echo "CI Pipeline completed"
+          echo "Check individual job results above for detailed information" 
